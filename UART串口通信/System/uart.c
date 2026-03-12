@@ -116,4 +116,17 @@ void UART_RxCpltCallback(UART_Ctx *ctx)
     HAL_UART_Receive_IT(ctx->huart,
                         ctx->rx_buf + ctx->rx_index, 1);
 }
+
 #endif
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * CubeMX 配置
+ *
+ * 波特率： 115200
+ * 数据位： 8
+ * 停止位： 1
+ * 校验：   None
+ * 模式：   TX/RX
+ * 开启：   USART1 global interrupt
+* ───────────────────────────────────────────────────────────────────────────*/
