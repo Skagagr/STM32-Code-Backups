@@ -30,7 +30,7 @@
  *  @endcode
  *
  * @version 1.0.0
- * @date    2026-03-12
+ * @date    2026-03-13
  */
 
 #ifndef __TIMER_H

@@ -9,7 +9,7 @@
  *  1/T = 1/T0 + (1/B) × ln(R/R0)
  *
  * @version 1.0.0
- * @date    2026-03-12
+ * @date    2026-03-14
  */
 
 #include "adc.h"
