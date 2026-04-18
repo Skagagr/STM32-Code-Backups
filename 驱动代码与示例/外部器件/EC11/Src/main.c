@@ -10,6 +10,7 @@ static EXTICtx_t g_exti_pa1;  // PA1 外部中断句柄
 // --------------------中断共享变量--------------------
 static volatile uint8_t g_pa0_flag = 0;
 static volatile uint8_t g_pa1_flag = 0;
+static volatile uint8_t zheng_fan = 0;
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -17,7 +18,19 @@ static void MX_GPIO_Init(void);
 // --------------------回调函数--------------------
 static void PA0_Callback(void)
 {
-    g_pa0_flag = 1;
+    // g_pa0_flag = 1;
+    // 反转，B 超前 A 90°
+    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2) == 0)
+    {
+        if (zheng_fan > 0)
+            zheng_fan--;
+    }
+    // 正转，A 超前 B 90°
+    else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2) == 1)
+    {
+        if (zheng_fan < 2)
+            zheng_fan++;
+    }
 
 }
 
@@ -26,7 +39,7 @@ static void PA1_Callback(void)
     g_pa1_flag = 1;
 }
 
-// --------------------HAL 弱函数重写--------------------
+// H--------------------AL 弱函数重写--------------------
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     EXTI_Handler(&g_exti_pa0, GPIO_Pin);
@@ -62,23 +75,53 @@ int main(void)
     // 初始化 PA5 的LED端口
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     __HAL_RCC_GPIOA_CLK_ENABLE();
+
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
-    GPIO_InitStruct.Pin = GPIO_PIN_5;
+    GPIO_InitStruct.Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    // 初始化 PA2 的按键端口
+    // GPIO_InitTypeDef GPIO_InitStruct = {0};
+    // __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     while (1)
     {
-        if (g_pa0_flag) // 处理 PA0 事件
+        // if (g_pa0_flag) // 处理 PA0 事件
+        // {
+        //     g_pa0_flag = 0;
+        //     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+        // }
+        // if (g_pa1_flag) // 处理 PA1 事件
+        // {
+        //     g_pa1_flag = 0;
+        //     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+        // }
+
+        // 正转亮起的LED右移，反转左移，只能在0 1 2间移动
+        if (zheng_fan == 0)
         {
-            g_pa0_flag = 0;
-            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-        }
-        if (g_pa1_flag) // 处理 PA1 事件
-        {
-            g_pa1_flag = 0;
             HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+        }
+        else if (zheng_fan == 1)
+        {
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+        }
+        else if (zheng_fan == 2)
+        {
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
         }
     }
 
