@@ -1,13 +1,25 @@
+/**
+ * @file    sht3x.h
+ * @brief   SHT30 温湿度传感器驱动接口
+ *
+ * @details
+ *  定义 SHT30_Ctx 上下文结构体及公开接口函数声明。
+ *  依赖 i2c_bus.h，包含此头文件即可使用 SHT30 驱动。
+ *
+ * @version 1.0.0
+ * @date    2026-05-02
+ */
 #ifndef __SHT3X_H
 #define __SHT3X_H
 
+#include "main.h"
 #include "i2c_bus.h"
 
 #define SHT30_I2C_ADDR   0x88U
 
 typedef struct
 {
-    I2C_Bus_Ctx *bus;                          // I2C 总线句柄指针
+    I2C_Bus_Ctx *bus;       // I2C 总线句柄指针
     uint8_t buf[6];         // 读取的6字节原始数据
 } SHT30_Ctx;
 
