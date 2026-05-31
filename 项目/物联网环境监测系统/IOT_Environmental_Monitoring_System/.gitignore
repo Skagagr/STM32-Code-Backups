@@ -1,0 +1,38 @@
+# === 编译产物 ===
+build/
+*.elf
+*.bin
+*.hex
+*.map
+*.o
+*.obj
+*.list
+
+# === CubeMX 临时文件 ===
+mx.scratch
+.mxproject
+
+# === IDE / 编辑器 ===
+.settings/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Claude Code 内部 ===
+.claude/
+
+# === 语言服务器 ===
+.clangd/
+
+# === 操作系统 ===
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# === 调试 ===
+*.scvd
+
+# === 依赖（如果用 git submodule 管理 Drivers 则取消注释） ===
+# Drivers/
