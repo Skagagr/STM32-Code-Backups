@@ -75,7 +75,7 @@ uint8_t MQTT_Connect(ESP8266_Bus_Ctx *ctx)
  * JSON 格式示例: {"temp":25.60,"humi":60.20}
  */
 
-uint8_t MQTT_Publish(ESP8266_Bus_Ctx *ctx, float temp, float humi)
+uint8_t MQTT_Publish_Sensor(ESP8266_Bus_Ctx *ctx, float temp, float humi)
 {
     uint8_t data[128];
     uint8_t remaining_length;
@@ -94,6 +94,43 @@ uint8_t MQTT_Publish(ESP8266_Bus_Ctx *ctx, float temp, float humi)
     data[3] = 0x0C;                          // 主题长度 LSB = 12
     memcpy(&data[4], "stm32/sensor", 12);    // 主题名
     memcpy(&data[16], payload, strlen(payload));  // JSON 负载
+
+    return ESP8266_Send(ctx, data, 2 + remaining_length);
+}
+
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * MQTT PUBLISH 报文（温湿度阈值上报）
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * 固定报头   : 0x30 (PUBLISH, QoS 0, 不保留)
+ * 剩余长度   : 2 + 12 + strlen(payload)  （动态计算）
+ * 主题长度   : 0x00 0x0C (12)
+ * 主题名     : "stm32/threshold"
+ * 负载       : sprintf 生成的 JSON 字符串
+ *
+ * JSON 格式示例: {"temp_threshold":25,"humi_threshold":60}
+ */
+
+uint8_t MQTT_Publish_Threshold(ESP8266_Bus_Ctx *ctx, uint8_t temp_threshold, uint8_t humi_threshold)
+{
+    uint8_t data[128];
+    uint8_t remaining_length;
+    char payload[64] = {0};
+
+    // 构造 JSON 负载
+    sprintf(payload, "{\"temp_threshold\":%d,\"humi_threshold\":%d}", temp_threshold, humi_threshold);
+
+    // 剩余长度 = 主题长度前缀(2) + 主题名(15) + JSON负载
+    remaining_length = strlen(payload) + 2 + 15;
+
+    // 拼装 MQTT PUBLISH 报文
+    data[0] = 0x30;                                 // 固定报头
+    data[1] = (uint8_t)remaining_length;            // 剩余长度（<128 字节，单字节编码）
+    data[2] = 0x00;                                 // 主题长度 MSB
+    data[3] = 0x0F;                                 // 主题长度 LSB = 15
+    memcpy(&data[4], "stm32/threshold", 15);        // 主题名
+    memcpy(&data[19], payload, strlen(payload));    // JSON 负载
 
     return ESP8266_Send(ctx, data, 2 + remaining_length);
 }

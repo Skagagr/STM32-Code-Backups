@@ -45,7 +45,20 @@ uint8_t MQTT_Connect(ESP8266_Bus_Ctx *ctx);
  * @param humi 湿度值（%RH）
  * @return     1=成功, 0=发送失败
  */
-uint8_t MQTT_Publish(ESP8266_Bus_Ctx *ctx, float temp, float humi);
+uint8_t MQTT_Publish_Sensor(ESP8266_Bus_Ctx *ctx, float temp, float humi);
+
+/**
+ * @brief  发送温湿度传感器阈值数据
+ *
+ * 构造 MQTT PUBLISH 报文，发布 JSON 格式温湿度到主题 stm32/threshold。
+ * 负载格式：{"temp_threshold":XX,"humi_threshold":XX}
+ *
+ * @param ctx               ESP8266 上下文指针
+ * @param temp_threshold    温度值（℃）
+ * @param humi_threshold    湿度值（%RH）
+ * @return                  1=成功, 0=发送失败
+ */
+uint8_t MQTT_Publish_Threshold(ESP8266_Bus_Ctx *ctx, uint8_t temp_threshold, uint8_t humi_threshold);
 
 /**
  * @brief  订阅云端控制主题

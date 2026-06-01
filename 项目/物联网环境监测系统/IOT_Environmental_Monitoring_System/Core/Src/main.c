@@ -77,6 +77,7 @@
 #include "sht3x.h"
 #include "esp8266.h"
 #include "mqtt.h"
+#include "stm32f1xx_hal.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -192,9 +193,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         {
             ctx->ipd_buf[ctx->ipd_index] = '\0';
             ctx->ipd_recv_len = ctx->ipd_expect_len;
-            ctx->ipd_ready     = 1;
             ctx->ipd_receiving = 0;
             ctx->ipd_index     = 0;
+
+            // 发送期间：延迟通知，避免ipd_ready被主循环提前消费
+            if (ctx->sending)
+                ctx->ipd_pending = 1;
+            else
+                ctx->ipd_ready = 1;
         }
         HAL_UART_Receive_IT(ctx->huart, &ctx->rx_temp, 1);
         return;
@@ -272,61 +278,48 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- *
- * 初始化流程
- * ──────────
- * 1. 系统时钟配置：HSE 8MHz → PLL ×9 = 72MHz
- * 2. 外设初始化：GPIO → I2C1 → UART1
- * 3. 驱动层初始化：I2C 总线 → OLED → SHT30
- * 4. 网络连接：ESP8266 初始化 → WiFi 连接 → TCP 连接 broker
- * 5. MQTT 握手：CONNECT → SUBSCRIBE (stm32/control)
- * 6. OLED 显示初始化状态 500ms
- *
- * 主循环（每 500ms 执行一次）
- * ──────────────────────────
- * 1. 检查 ipd_ready 标志，处理云端指令（LED_ON / LED_OFF）
- * 2. 延时 500ms
- * 3. 更新 OLED 显示（系统 Tick、温湿度）
- * 4. 读取 SHT30 传感器
- * 5. 发布温湿度 JSON 报文到 stm32/sensor
- */
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
 
-    /* USER CODE BEGIN 1 */
-    uint8_t init_ok = 0;
-    float temp = 0, humi = 0;
+  /* USER CODE BEGIN 1 */
+    uint8_t init_ok = 0;    
+    float temp = 0, humi = 0;                           // 温度 湿度
+    uint8_t temp_threshold = 25, humi_threshold = 60;   // 温度阈值 湿度阈值，范围0 - 255
+    static uint32_t last_sensor_tick = 0;               // 用于定时刷新 OLED 和上报
+    static uint32_t last_blink_tick = 0;                // 用于 超阈值报警 LED 闪烁
+    uint8_t oled_need_refresh = 0;                      // OLED 主动刷新标志位
+    static uint32_t last_key_tick = 0;                  // 按键消抖
+    static uint32_t last_upload_tick = 0;               // 10秒上报一次
 
-    /* USER CODE END 1 */
+  /* USER CODE END 1 */
 
-    /* MCU Configuration--------------------------------------------------------*/
+  /* MCU Configuration--------------------------------------------------------*/
 
-    /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-    HAL_Init();
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
 
-    /* USER CODE BEGIN Init */
+  /* USER CODE BEGIN Init */
 
-    /* USER CODE END Init */
+  /* USER CODE END Init */
 
-    /* Configure the system clock */
-    SystemClock_Config();
+  /* Configure the system clock */
+  SystemClock_Config();
 
-    /* USER CODE BEGIN SysInit */
+  /* USER CODE BEGIN SysInit */
 
-    /* USER CODE END SysInit */
+  /* USER CODE END SysInit */
 
-    /* Initialize all configured peripherals */
-    MX_GPIO_Init();
-    MX_I2C1_Init();
-    MX_USART1_UART_Init();
-    /* USER CODE BEGIN 2 */
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
     I2C_Bus_Init(&i2c1_ctx, &hi2c1);
     OLED_Init(&oled_ctx, &i2c1_ctx);
     SHT30_Init(&sht30_ctx, &i2c1_ctx);
-
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);   // LED 初始熄灭（高电平）
 
     // 确保 UART 中断接收可正常挂起
     huart1.RxState = HAL_UART_STATE_READY;
@@ -351,14 +344,14 @@ int main(void)
         OLED_ShowString(&oled_ctx, 0, 0, "ESP fail");
 
     OLED_Refresh(&oled_ctx);
-    HAL_Delay(500);   // 短暂展示初始化结果
+    HAL_Delay(3000);   // 短暂展示初始化结果
 
     // 初始化失败时点亮 LED 告警（PC13 低电平有效）
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, init_ok ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    /* USER CODE END 2 */
+  /* USER CODE END 2 */
 
-    /* Infinite loop */
-    /* USER CODE BEGIN WHILE */
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
     while (1)
     {
         // 处理云端指令（ipd_ready 由 UART 回调中的 IPD 状态机置位）
@@ -374,37 +367,104 @@ int main(void)
                 HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);   // 高电平熄灭
         }
 
-        HAL_Delay(500);
+        // 处理按键，100ms轮询一次，兼顾消抖和长按速度
+        if (HAL_GetTick() - last_key_tick >= 100)
+        {
+            last_key_tick = HAL_GetTick();
 
-        // 更新 OLED 显示：系统运行时长
-        OLED_Clear(&oled_ctx);
-        OLED_ShowString(&oled_ctx, 0, 16, "Tick:");
-        OLED_ShowNum(&oled_ctx, 44, 16, HAL_GetTick(), 0);
+            if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) == GPIO_PIN_RESET)
+            {
+                temp_threshold++;
+                oled_need_refresh = 1;
+            }
+            else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_RESET)
+            {
+                temp_threshold--;
+                oled_need_refresh = 1;
+            }
+            else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6) == GPIO_PIN_RESET)
+            {
+                humi_threshold++;
+                oled_need_refresh = 1;
+            }
+            else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_RESET)
+            {
+                humi_threshold--;
+                oled_need_refresh = 1;
+            }
+    }
 
-        // 读取 SHT30 温湿度传感器（I2C，地址 0x44）
-        SHT30_Read(&sht30_ctx, &temp, &humi);
-        OLED_ShowFloat(&oled_ctx, 0, 32, temp, 2);
-        OLED_ShowFloat(&oled_ctx, 0, 48, humi, 2);
+        // 超阈值报警闪烁
+        if (temp >= temp_threshold || humi >= humi_threshold) 
+        {
+            if (HAL_GetTick() - last_blink_tick >= 100)
+            {
+                last_blink_tick = HAL_GetTick();
+                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_14);
+            }
+        }
+        else
+        {
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14, GPIO_PIN_SET);
+            last_blink_tick = HAL_GetTick();
+        }
 
-        // 发布温湿度 JSON 报文到 MQTT 主题 stm32/sensor
-        MQTT_Publish(&esp8266_ctx, temp, humi);
+        // 每1秒读取温湿度
+        if (HAL_GetTick() - last_sensor_tick >= 1000)
+        {
+            last_sensor_tick = HAL_GetTick();
+            // 读取 SHT30 温湿度传感器（I2C，地址 0x44）
+            SHT30_Read(&sht30_ctx, &temp, &humi);
+            oled_need_refresh = 1;
+        }
 
-        OLED_Refresh(&oled_ctx);
+        // 刷新 OLED
+        if (oled_need_refresh)
+        {
+            oled_need_refresh = 0;
+
+            // 更新 OLED 显示：系统运行时长
+            OLED_Clear(&oled_ctx);
+            OLED_ShowString(&oled_ctx, 0, 16, "Second:");
+            OLED_ShowNum(&oled_ctx, 60, 16, HAL_GetTick() / 1000, 0);
+
+            // OLED 显示温湿度
+            OLED_ShowFloat(&oled_ctx, 0, 32, temp, 2);
+            OLED_ShowFloat(&oled_ctx, 0, 48, humi, 2);
+            // OLED 显示温湿度阈值
+            OLED_ShowString(&oled_ctx, 68, 32, "Max:");
+            OLED_ShowNum(&oled_ctx, 104, 32, temp_threshold, 0);
+            OLED_ShowString(&oled_ctx, 68, 48, "Max:");
+            OLED_ShowNum(&oled_ctx, 104, 48, humi_threshold, 0);
+
+            // OLED_ShowString(&oled_ctx, 0, 0, (char*)esp8266_ctx.rx_buf);
+
+            OLED_Refresh(&oled_ctx);
+        }
+
+         // 每10秒上报，温湿度和温湿度阈值
+        if (HAL_GetTick() - last_upload_tick >= 10000)
+        {
+            last_upload_tick = HAL_GetTick();
+
+            if (init_ok)
+            {
+                MQTT_Publish_Sensor(&esp8266_ctx, temp, humi);
+                MQTT_Publish_Threshold(&esp8266_ctx, temp_threshold, humi_threshold);
+            }
+        }
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
     }
-    /* USER CODE END 3 */
+  /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- *
- * HSE (8MHz) → PLL ×9 → SYSCLK 72MHz
- * AHB = 72MHz, APB1 = 36MHz, APB2 = 72MHz
- */
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -441,12 +501,10 @@ void SystemClock_Config(void)
 }
 
 /**
- * @brief I2C1 Initialization Function
- * @param None
- * @retval None
- *
- * PB6(SCL) + PB7(SDA)，100kHz 标准模式
- */
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
 
@@ -477,12 +535,10 @@ static void MX_I2C1_Init(void)
 }
 
 /**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- *
- * PA9(TX) + PA10(RX)，115200-8N1，中断接收模式
- */
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART1_UART_Init(void)
 {
 
@@ -512,17 +568,16 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- *
- * PC13 推挽输出（板载 LED 控制，低电平点亮）
- */
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
+    // PC 13 14 15 LED
+    // PA 4 5 6 7 按键
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
@@ -532,14 +587,20 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_SET);
 
-  /*Configure GPIO pin : PC13 */
-  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  /*Configure GPIO pins : PC13 PC14 PC15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA4 PA5 PA6 PA7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -551,9 +612,9 @@ static void MX_GPIO_Init(void)
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
@@ -564,15 +625,14 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */

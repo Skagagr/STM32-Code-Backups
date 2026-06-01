@@ -129,26 +129,26 @@ uint8_t ESP8266_Init(ESP8266_Bus_Ctx *ctx, UART_HandleTypeDef *huart)
     HAL_UART_Receive_IT(ctx->huart, &ctx->rx_temp, 1);
 
     // 关闭 AT 回显，避免响应中混杂命令本身的拷贝
-    ESP8266_SendCmd(ctx, "ATE0\r\n", "OK", 1000);
+    ESP8266_SendCmd(ctx, "ATE0\r\n", "OK", 5000);
 
     ctx->rx_ready = 0;
     ctx->rx_index = 0;
     HAL_UART_Receive_IT(ctx->huart, &ctx->rx_temp, 1);
 
     // 基础 AT 通信测试
-    if (!ESP8266_SendCmd(ctx, "AT\r\n", "OK", 1000))
+    if (!ESP8266_SendCmd(ctx, "AT\r\n", "OK", 5000))
         return 0;
 
     // 设置为 Station 模式（客户端）
-    if (!ESP8266_SendCmd(ctx, "AT+CWMODE=1\r\n", "OK", 1000))
+    if (!ESP8266_SendCmd(ctx, "AT+CWMODE=1\r\n", "OK", 5000))
         return 0;
 
-    // 连接 WiFi 接入点（超时 10 秒，留足弱信号重试时间）
+    // 连接 WiFi 接入点（超时 20 秒，留足弱信号重试时间）
     if (!ESP8266_SendCmd(ctx,
-        "AT+CWJAP=\"12345678\",\"66666666\"\r\n", "GOT IP", 10000))
+        "AT+CWJAP=\"12345678\",\"66666666\"\r\n", "GOT IP", 20000))
         return 0;
 
-    HAL_Delay(2000);  // 等待网络栈稳定
+    HAL_Delay(10000);  // 等待网络栈稳定
 
     return 1;
 }
@@ -157,7 +157,7 @@ uint8_t ESP8266_Init(ESP8266_Bus_Ctx *ctx, UART_HandleTypeDef *huart)
  * 建立 TCP 连接
  * ───────────────────────────────────────────────────────────────────────────
  *
- * 发送 AT+CIPSTART="TCP","host",port，等待 CONNECT 响应（超时 15 秒）。
+ * 发送 AT+CIPSTART="TCP","host",port，等待 CONNECT 响应（超时 20 秒）。
  * 连接建立后清空 rx_buf 残留数据。
  */
 
@@ -167,10 +167,10 @@ uint8_t ESP8266_TCPConnect(ESP8266_Bus_Ctx *ctx, const char* host,
     char cmd[128] = {0};
     sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", host, port);
 
-    if(!ESP8266_SendCmd(ctx, cmd, "CONNECT", 15000))
+    if(!ESP8266_SendCmd(ctx, cmd, "CONNECT", 20000))
         return 0;
 
-    HAL_Delay(500);
+    HAL_Delay(1000);
     ctx->rx_ready = 0;
     ctx->rx_index = 0;
 
@@ -200,15 +200,38 @@ uint8_t ESP8266_Send(ESP8266_Bus_Ctx *ctx, const uint8_t* data,
     char cmd[128] = {0};
     sprintf(cmd, "AT+CIPSEND=%d\r\n", length);
 
+    ctx->sending = 1;  // 标记发送中，通知中断回调延迟置位 ipd_ready
+
     // 步骤 1：请求发送，等待 '>' 提示符
     if(!ESP8266_SendCmd(ctx, cmd, ">", 1000))
+    {
+        ctx->sending = 0;
         return 0;
+    }
 
     // 步骤 2：发送原始字节数据
     HAL_UART_Transmit(ctx->huart, data, length, 100);
 
     // 步骤 3：等待 SEND OK 确认（防止 UART 冲突，不可省略！）
+    // ─────────────────────────────────────────────────────────
+    // ESP8266 发送完数据后会回复 "SEND OK"，表示本次发送完全结束。
+    // 只有收到 "SEND OK"，ESP8266 才真正空闲，可以接受下一条命令。
+    // 若不等待直接返回，下一条 AT+CIPSEND 发出时 ESP8266 可能仍在
+    // 处理上一条数据，导致返回 ERROR，本次发送失败。
+    // 因此两次连续 MQTT_Publish 之间无需额外 HAL_Delay——
+    // 本步骤已保证第一条发完 ESP8266 必然空闲。
     ESP8266_SendCmd(ctx, "", "SEND OK", 2000);
+
+    ctx->sending = 0;  // 发送完成，恢复正常 ipd_ready 置位
+
+    // 发送期间若收到 IPD 数据，中断回调会置 ipd_pending 而非 ipd_ready，
+    // 避免主循环在发送未完成时提前消费 IPD 数据导致状态混乱。
+    // 发送结束后在此统一转移，确保云端指令不丢失。
+    if (ctx->ipd_pending)
+    {
+        ctx->ipd_pending = 0;
+        ctx->ipd_ready   = 1;
+    }
 
     return 1;
 }

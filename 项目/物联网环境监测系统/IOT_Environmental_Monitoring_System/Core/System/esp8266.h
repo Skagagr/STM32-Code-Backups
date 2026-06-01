@@ -68,6 +68,8 @@ typedef struct
     uint16_t ipd_recv_len;           /**< 实际接收到的 IPD 字节数 */
 
     uint8_t  ipd_prefix_idx;         /**< "+IPD," 前缀匹配进度：0=空闲 1-4=匹配中 5=已匹配 */
+    volatile uint8_t sending;      /**< 正在发送中，延迟置位 ipd_ready */
+    volatile uint8_t ipd_pending;  /**< 发送期间收到IPD，待发送完后置位ipd_ready */
 } ESP8266_Bus_Ctx;
 
 /* ───────────────────────────────────────────────────────────────────────────

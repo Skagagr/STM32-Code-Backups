@@ -25,7 +25,6 @@ mx.scratch
 
 # === 语言服务器 ===
 .clangd/
-.clangd
 
 # === 操作系统 ===
 Thumbs.db
