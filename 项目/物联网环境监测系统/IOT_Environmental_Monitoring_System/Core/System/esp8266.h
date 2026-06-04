@@ -7,12 +7,10 @@
  *   基于 HAL UART 中断接收 + 超时轮询的混合模式。
  *
  *   依赖
- *   ────
  *   - STM32 HAL 库 (UART)
  *   - main.h (string.h, stdio.h)
  *
  *   使用示例
- *   ────────
  *   @code
  *   ESP8266_Bus_Ctx ctx;
  *   ESP8266_Init(&ctx, &huart1);
@@ -21,7 +19,6 @@
  *   @endcode
  *
  *   注意事项
- *   ────────
  *   - ESP8266 供电须使用 3.3V，不可直接接 5V
  *   - 本驱动基于固件版本 1.2.0.0（不支持 AT+MQTT 指令）
  *   - 发送前须确保 TCP 连接已建立
@@ -43,10 +40,10 @@
  * 以及 IPD 状态机的运行时变量。所有字段由 HAL_UART_RxCpltCallback
  * 和 ESP8266_SendCmd 协同维护。
  *
- * 双缓冲区设计
- * ────────────
+ * 双缓冲区 + 状态机
  * - rx_buf[]   : AT 命令响应缓冲区（以 '\n' 为帧结束标志）
  * - ipd_buf[]  : 云端 IPD 数据缓冲区（以字节计数为结束标志）
+ * - ipd_state  : 统一状态机（0=空闲 1-5=匹配"+IPD," 6=吸收数据）
  * 两者完全独立，避免二进制 MQTT 报文干扰 AT 响应解析。
  */
 typedef struct
@@ -63,18 +60,11 @@ typedef struct
 
     uint8_t  rx_temp;                /**< 单字节中断接收暂存 */
 
-    volatile uint8_t ipd_receiving;  /**< 正在吸收 IPD 数据（状态机状态 3） */
     uint16_t ipd_expect_len;         /**< +IPD,N: 中的 N（期望接收字节数） */
-    uint16_t ipd_recv_len;           /**< 实际接收到的 IPD 字节数 */
-
-    uint8_t  ipd_prefix_idx;         /**< "+IPD," 前缀匹配进度：0=空闲 1-4=匹配中 5=已匹配 */
-    volatile uint8_t sending;      /**< 正在发送中，延迟置位 ipd_ready */
-    volatile uint8_t ipd_pending;  /**< 发送期间收到IPD，待发送完后置位ipd_ready */
+    uint8_t  ipd_state;              /**< IPD 状态机：0=空闲 1-5=匹配前缀 6=吸收数据 */
 } ESP8266_Bus_Ctx;
 
-/* ───────────────────────────────────────────────────────────────────────────
- * 公开接口
- * ─────────────────────────────────────────────────────────────────────────── */
+/* 公开接口 */
 
 /**
  * @brief  发送 AT 命令并等待期望的响应

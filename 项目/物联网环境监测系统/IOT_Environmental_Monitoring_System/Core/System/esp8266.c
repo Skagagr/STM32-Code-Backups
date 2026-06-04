@@ -6,12 +6,10 @@
  *   基于 HAL UART 中断接收 + 超时轮询的混合通信模式。
  *
  *   通信流程
- *   ────────
  *   发送 AT 命令 → 挂起中断接收 → 等待 rx_ready 标志或超时 →
  *   检查响应中是否包含期望字符串。
  *
  *   IPD 接收
- *   ────────
  *   ESP8266 的 TCP 数据异步通知（+IPD）由 HAL_UART_RxCpltCallback
  *   中的状态机实时处理，不在本文件中。本文件仅负责命令的发送和
  *   响应等待。
@@ -32,7 +30,6 @@
  *   ╚══════════════════════════════════════════════════════════════╝
  *
  *   依赖
- *   ────
  *   - stm32f1xx_hal.h  (HAL_UART_Transmit, HAL_UART_Receive_IT)
  *   - esp8266.h        (ESP8266_Bus_Ctx)
  *   - main.h           (string.h)
@@ -44,13 +41,10 @@
 #include "esp8266.h"
 #include "stm32f1xx_hal.h"
 
-/* ───────────────────────────────────────────────────────────────────────────
- * 发送 AT 命令并等待响应
- * ───────────────────────────────────────────────────────────────────────────
+/* 发送 AT 命令并等待响应
  *
  * 工作流程
- * ────────
- * 1. 若 ipd_prefix_idx == 0（不在 +IPD 前缀匹配中），清空 rx_buf 和
+ * 1. 若 ipd_state == 0（不在 +IPD 前缀匹配中），清空 rx_buf 和
  *    rx_ready，准备接收新响应。
  * 2. 挂起单字节中断接收 (HAL_UART_Receive_IT)。
  * 3. 若 cmd 非空，阻塞发送命令字符串。
@@ -60,7 +54,6 @@
  * 6. 超时返回 0。
  *
  * 为什么允许空命令
- * ────────────────
  * 当仅需等待响应（如 SEND OK）而不发送新命令时，传入空字符串 ""，
  * 函数跳过 HAL_UART_Transmit 直接进入等待循环。
  */
@@ -71,7 +64,7 @@ uint8_t ESP8266_SendCmd(ESP8266_Bus_Ctx *ctx, const char *cmd,
     uint32_t tick;
 
     // 若不在 +IPD 前缀匹配中，清空缓冲区准备接收新响应
-    if (ctx->ipd_prefix_idx == 0)
+    if (ctx->ipd_state == 0)
     {
         ctx->rx_ready = 0;
         ctx->rx_index = 0;
@@ -96,6 +89,10 @@ uint8_t ESP8266_SendCmd(ESP8266_Bus_Ctx *ctx, const char *cmd,
             if (strstr((char *)ctx->rx_buf, expect) != NULL)
                 return 1;
 
+            // ERROR 表示命令失败，立即返回避免傻等超时
+            if (strstr((char *)ctx->rx_buf, "ERROR") != NULL)
+                return 0;
+
             // +IPD 不是我们要等的响应，跳过继续等
             if (strstr((char *)ctx->rx_buf, "+IPD") != NULL)
                 continue;
@@ -104,9 +101,7 @@ uint8_t ESP8266_SendCmd(ESP8266_Bus_Ctx *ctx, const char *cmd,
     return 0;
 }
 
-/* ───────────────────────────────────────────────────────────────────────────
- * ESP8266 初始化 & WiFi 连接
- * ───────────────────────────────────────────────────────────────────────────
+/* ESP8266 初始化 & WiFi 连接
  *
  * 执行序列（每步均验证响应，任何失败返回 0）
  *   1. 等待 3 秒让模块上电稳定
@@ -122,6 +117,10 @@ uint8_t ESP8266_Init(ESP8266_Bus_Ctx *ctx, UART_HandleTypeDef *huart)
     if (ctx == NULL || huart == NULL) return 0;
     ctx->huart = huart;
 
+    // 硬复位 ESP8266（拉低 RST 50ms）
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);
+    HAL_Delay(50);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
     HAL_Delay(3000);  // 等待 ESP8266 上电启动
 
     ctx->rx_ready = 0;
@@ -143,19 +142,30 @@ uint8_t ESP8266_Init(ESP8266_Bus_Ctx *ctx, UART_HandleTypeDef *huart)
     if (!ESP8266_SendCmd(ctx, "AT+CWMODE=1\r\n", "OK", 5000))
         return 0;
 
-    // 连接 WiFi 接入点（超时 20 秒，留足弱信号重试时间）
-    if (!ESP8266_SendCmd(ctx,
-        "AT+CWJAP=\"12345678\",\"66666666\"\r\n", "GOT IP", 20000))
-        return 0;
+    HAL_Delay(500);  // 等待模式切换完成
+
+    // 连接 WiFi 接入点，失败重试 3 次
+    {
+        uint8_t cwjap_ok = 0;
+        for (int retry = 0; retry < 3; retry++)
+        {
+            if (ESP8266_SendCmd(ctx,
+                "AT+CWJAP=\"12345678\",\"66666666\"\r\n", "OK", 15000))
+            {
+                cwjap_ok = 1;
+                break;
+            }
+            HAL_Delay(1000);  // 重试前等待 1 秒
+        }
+        if (!cwjap_ok) return 0;
+    }
 
     HAL_Delay(10000);  // 等待网络栈稳定
 
     return 1;
 }
 
-/* ───────────────────────────────────────────────────────────────────────────
- * 建立 TCP 连接
- * ───────────────────────────────────────────────────────────────────────────
+/* 建立 TCP 连接
  *
  * 发送 AT+CIPSTART="TCP","host",port，等待 CONNECT 响应（超时 20 秒）。
  * 连接建立后清空 rx_buf 残留数据。
@@ -177,12 +187,9 @@ uint8_t ESP8266_TCPConnect(ESP8266_Bus_Ctx *ctx, const char* host,
     return 1;
 }
 
-/* ───────────────────────────────────────────────────────────────────────────
- * 通过 TCP 发送任意数据
- * ───────────────────────────────────────────────────────────────────────────
+/* 通过 TCP 发送任意数据
  *
  * 严格执行三步握手，确保 ESP8266 处理完毕才返回
- * ─────────────────────────────────────────────────
  *
  *   1. AT+CIPSEND=<length>  →  等待 '>' 提示符
  *   2. 发送 <length> 字节原始数据
@@ -200,20 +207,14 @@ uint8_t ESP8266_Send(ESP8266_Bus_Ctx *ctx, const uint8_t* data,
     char cmd[128] = {0};
     sprintf(cmd, "AT+CIPSEND=%d\r\n", length);
 
-    ctx->sending = 1;  // 标记发送中，通知中断回调延迟置位 ipd_ready
-
     // 步骤 1：请求发送，等待 '>' 提示符
     if(!ESP8266_SendCmd(ctx, cmd, ">", 1000))
-    {
-        ctx->sending = 0;
         return 0;
-    }
 
     // 步骤 2：发送原始字节数据
     HAL_UART_Transmit(ctx->huart, data, length, 100);
 
     // 步骤 3：等待 SEND OK 确认（防止 UART 冲突，不可省略！）
-    // ─────────────────────────────────────────────────────────
     // ESP8266 发送完数据后会回复 "SEND OK"，表示本次发送完全结束。
     // 只有收到 "SEND OK"，ESP8266 才真正空闲，可以接受下一条命令。
     // 若不等待直接返回，下一条 AT+CIPSEND 发出时 ESP8266 可能仍在
@@ -222,23 +223,10 @@ uint8_t ESP8266_Send(ESP8266_Bus_Ctx *ctx, const uint8_t* data,
     // 本步骤已保证第一条发完 ESP8266 必然空闲。
     ESP8266_SendCmd(ctx, "", "SEND OK", 2000);
 
-    ctx->sending = 0;  // 发送完成，恢复正常 ipd_ready 置位
-
-    // 发送期间若收到 IPD 数据，中断回调会置 ipd_pending 而非 ipd_ready，
-    // 避免主循环在发送未完成时提前消费 IPD 数据导致状态混乱。
-    // 发送结束后在此统一转移，确保云端指令不丢失。
-    if (ctx->ipd_pending)
-    {
-        ctx->ipd_pending = 0;
-        ctx->ipd_ready   = 1;
-    }
-
     return 1;
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * CubeMX 配置说明
- * ─────────────────────────────────────────────────────────────────────────────
+/* CubeMX 配置说明
  *
  * 【Connectivity → USART1】
  *   ├─ Mode         : Asynchronous
@@ -259,5 +247,4 @@ uint8_t ESP8266_Send(ESP8266_Bus_Ctx *ctx, const uint8_t* data,
  *   ├─ ESP8266_Init 必须在 MX_USART1_UART_Init 之后调用
  *   ├─ 本驱动基于固件版本 1.2.0.0（不支持 AT+MQTT 指令）
  *   └─ ESP8266_Send 发送前须确保 TCP 连接已建立
- *
- * ─────────────────────────────────────────────────────────────────────────────*/
+ */

@@ -9,7 +9,6 @@
  *   报文格式均基于 MQTT 3.1.1 规范，QoS 0（至多一次）。
  *
  *   依赖
- *   ────
  *   - esp8266.h (ESP8266_Send)
  *   - main.h    (string.h, stdio.h)
  *

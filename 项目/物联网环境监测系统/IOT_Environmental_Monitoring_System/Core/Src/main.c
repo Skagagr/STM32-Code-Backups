@@ -16,19 +16,16 @@
  ******************************************************************************
  *
  *   系统架构
- *   ────────
  *   STM32F103C8T6 通过 UART1 外接 ESP8266 WiFi 模块，基于 MQTT 3.1.1 协议
  *   与云端 broker (broker.emqx.io:1883) 通信。每 500ms 采集一次 SHT30 温湿度
  *   传感器数据，发布到主题 stm32/sensor；同时订阅主题 stm32/control 接收
  *   云端 LED_ON / LED_OFF 指令控制板载 LED (PC13)。
  *
  *   数据流
- *   ──────
  *   SHT30 ─I2C─> STM32 ─UART1─> ESP8266 ─WiFi─> MQTT Broker ──> 云端
  *   OLED  <──I2C─── STM32 <─UART1── ESP8266 <─WiFi── MQTT Broker <── 云端
  *
  *   外设引脚
- *   ────────
  *   PA9  = USART1_TX → ESP8266 RX
  *   PA10 = USART1_RX → ESP8266 TX
  *   PB6  = I2C1_SCL → OLED + SHT30
@@ -36,13 +33,11 @@
  *   PC13 = 板载 LED（低电平点亮）
  *
  *   通信协议栈
- *   ──────────
  *   MQTT 3.1.1 (QoS 0)
  *     └── ESP8266 AT 指令固件 v1.2.0.0
  *           └── UART 115200-8N1，中断接收（逐字节）
  *
  *   切换云端服务器
- *   ──────────────
  *   只需修改 main() 中的一行，格式为：
  *   ESP8266_TCPConnect(&esp8266_ctx, "服务器地址", 端口号);
  *
@@ -152,30 +147,25 @@ static uint8_t* bin_search(const uint8_t* haystack, uint16_t hay_len,
  * 本回调实现了一个逐字符状态机来实时检测并吸收 IPD 数据，避免依赖 '\n'
  * 终止符（因 MQTT 二进制报文通常不含换行）。
  *
- * 状态机转换图
- * ────────────
+ * 状态机转换图（ipd_state 统一管理）
  *
  *   ┌──────────┐   匹配 "+IPD," 逐字符   ┌──────────────┐
  *   │  IDLE    │ ──────────────────────> │  读取长度     │
- *   │ (普通AT) │  ipd_prefix_idx: 0→5   │ (等冒号)      │
- *   └──────────┘ <────────────────────── └──────┬───────┘
- *        ↑               非预期字符 / 换行        │ 收到 ':'
- *        │                                        ▼
- *        │                               ┌──────────────┐
- *        └─────────────────────────────── │  吸收数据     │
- *                收满 ipd_expect_len 字节  │ (ipd_receiving=1)
- *                                         └──────────────┘
+ *   │ state=0  │  state: 0→1→2→3→4→5  │  state=5     │
+ *   └──────────┘ <────────────────────── │ (等冒号)      │
+ *        ↑           非预期字符 / 换行    └──────┬───────┘
+ *        │                                       │ 收到 ':'
+ *        │                                       ▼
+ *        │                              ┌──────────────┐
+ *        └────────────────────────────── │  吸收数据     │
+ *               收满 ipd_expect_len 字节  │  state=6     │
+ *                                        └──────────────┘
  *
  * 关键设计决策
- * ────────────
- * 1. 逐字符前缀匹配 "+IPD,"，不依赖 strstr()，避免因 buffer 中存在
- *    0x00 字节导致的误判。
- * 2. 长度字段逐数字累加（ipd_expect_len = ipd_expect_len * 10 + digit），
- *    无需事后从缓冲区解析。
- * 3. IPD 数据直接存入独立的 ipd_buf[]，与 AT 响应缓冲区 rx_buf[] 分离，
- *    避免二进制数据干扰 AT 命令响应解析。
- * 4. '>' 和 '\n' 都会复位 ipd_prefix_idx，确保 AT 命令响应正确终止
- *    任何进行中的 IPD 前缀匹配。
+ * 1. 逐字符前缀匹配 "+IPD,"，不依赖 strstr()
+ * 2. 长度逐数字累加（ipd_expect_len = ipd_expect_len * 10 + digit）
+ * 3. ipd_buf[] 与 rx_buf[] 分离，二进制 MQTT 报文不干扰 AT 响应
+ * 4. '>' 和 '\n' 都会复位 ipd_state，终止进行中的 IPD 前缀匹配
  *
  * @param huart 触发中断的 UART 句柄
  */
@@ -185,45 +175,39 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     if (huart != ctx->huart) return;
     uint8_t byte = ctx->rx_temp;
 
-    /* ── 状态 1：IPD 数据吸收模式 ─────────────────────────────── */
-    if (ctx->ipd_receiving)
+    // IPD 数据吸收模式（ipd_state == 6）
+    if (ctx->ipd_state == 6)
     {
         ctx->ipd_buf[ctx->ipd_index++] = byte;
         if (ctx->ipd_index >= ctx->ipd_expect_len)
         {
             ctx->ipd_buf[ctx->ipd_index] = '\0';
-            ctx->ipd_recv_len = ctx->ipd_expect_len;
-            ctx->ipd_receiving = 0;
-            ctx->ipd_index     = 0;
-
-            // 发送期间：延迟通知，避免ipd_ready被主循环提前消费
-            if (ctx->sending)
-                ctx->ipd_pending = 1;
-            else
-                ctx->ipd_ready = 1;
+            ctx->ipd_state = 0;
+            ctx->ipd_index = 0;
+            ctx->ipd_ready = 1;
         }
         HAL_UART_Receive_IT(ctx->huart, &ctx->rx_temp, 1);
         return;
     }
 
-    /* ── 状态 2 / 3：+"IPD," 前缀匹配 → 读取长度 ────────────── */
+    // "+IPD," 前缀匹配 -> 读取长度
     static const char ipd_prefix[] = "+IPD,";
 
-    if (ctx->ipd_prefix_idx < 5)
+    if (ctx->ipd_state < 5)
     {
         /* 逐字符比对 "+IPD,"（共 5 个字符） */
-        if (byte == ipd_prefix[ctx->ipd_prefix_idx])
+        if (byte == ipd_prefix[ctx->ipd_state])
         {
-            ctx->ipd_prefix_idx++;
-            if (ctx->ipd_prefix_idx == 5)
+            ctx->ipd_state++;
+            if (ctx->ipd_state == 5)
                 ctx->ipd_expect_len = 0;   // 前缀匹配完毕，准备读取长度数字
         }
         else
         {
-            ctx->ipd_prefix_idx = (byte == '+') ? 1 : 0;  // 失配回退
+            ctx->ipd_state = (byte == '+') ? 1 : 0;  // 失配回退
         }
     }
-    else  // ipd_prefix_idx == 5：已匹配 "+IPD,"，逐数字累加长度
+    else  // ipd_state == 5：已匹配 "+IPD,"，逐数字累加长度
     {
         if (byte >= '0' && byte <= '9')
         {
@@ -232,27 +216,26 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         else if (byte == ':')
         {
             // 冒号触发数据吸收模式
-            ctx->ipd_index      = 0;
-            ctx->ipd_receiving  = 1;
-            ctx->ipd_prefix_idx = 0;
-            ctx->rx_index       = 0;
+            ctx->ipd_index = 0;
+            ctx->ipd_state = 6;
+            ctx->rx_index  = 0;
             HAL_UART_Receive_IT(ctx->huart, &ctx->rx_temp, 1);
             return;
         }
         else
         {
-            ctx->ipd_prefix_idx = 0;  // 非数字非冒号：重置
+            ctx->ipd_state = 0;  // 非数字非冒号：重置
         }
     }
 
-    /* ── 普通 AT 响应逐行处理 ───────────────────────────────── */
+    // 普通 AT 响应逐行处理
     if (byte == '>')
     {
         // AT+CIPSEND 发送就绪提示符：直接置位，不依赖换行
         ctx->rx_buf[0] = '>'; ctx->rx_buf[1] = '\0';
         ctx->rx_ready    = 1;
         ctx->rx_index    = 0;
-        ctx->ipd_prefix_idx = 0;
+        ctx->ipd_state = 0;
     }
     else if (byte == '\n')
     {
@@ -262,7 +245,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         ctx->rx_buf[ctx->rx_index] = '\0';
         ctx->rx_ready = 1;
         ctx->rx_index = 0;
-        ctx->ipd_prefix_idx = 0;
+        ctx->ipd_state = 0;
     }
     else
     {
@@ -357,7 +340,7 @@ int main(void)
         // 处理云端指令（ipd_ready 由 UART 回调中的 IPD 状态机置位）
         if (esp8266_ctx.ipd_ready == 1)
         {
-            uint16_t len = esp8266_ctx.ipd_recv_len;
+            uint16_t len = esp8266_ctx.ipd_expect_len;
             esp8266_ctx.ipd_ready = 0;
 
             // MQTT 报文含 0x00 字节，必须用 bin_search 而非 strstr
@@ -589,12 +572,22 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_SET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
+
   /*Configure GPIO pins : PC13 PC14 PC15 */
   GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PA4 PA5 PA6 PA7 */
   GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
